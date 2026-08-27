@@ -39,7 +39,7 @@ def skip_existing(stations: list[dict], raw_dir: Path, prefix: str) -> list[dict
 
 def main():
     ap = argparse.ArgumentParser(description="OPW hydrological bulk downloader")
-    ap.add_argument("--config",        default="C:\\Users\AdikariAdikari\PycharmProjects\Embeddings\config\config.yaml")
+    ap.add_argument("--config",        default="config\config.yaml")
     ap.add_argument("--subset",        default=None)
     ap.add_argument("--start",         default=None, help="Analysis start YYYY-MM-DD")
     ap.add_argument("--end",           default=None, help="Analysis end YYYY-MM-DD")
