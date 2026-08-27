@@ -10,13 +10,13 @@ api:
   retry_backoff: 2.0
   rate_limit_delay: 1.0
 
-station_overview: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/config/station_overview_table.csv"
+station_overview: "config/station_overview_table.csv"
 
 # -- Output --------------------------------------------------------------------
 output:
-  raw_water_level_dir: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/dataset/raw/water_level"
-  metadata_dir:        "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/dataset/metadata"
-  processed_dir:       "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/dataset/processed"
+  raw_water_level_dir: "dataset/raw/water_level"
+  metadata_dir:        "dataset/metadata"
+  processed_dir:       "dataset/processed"
 
 # -- Processing ----------------------------------------------------------------
 processing:
@@ -34,7 +34,7 @@ quality:
 logging:
   downloader:
     level: "INFO"
-    log_file: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/logs/downloader.log"
+    log_file: "logs/downloader.log"
   train:
     level: "INFO"
-    log_file: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/logs/train.log"
+    log_file: "logs/train.log"
