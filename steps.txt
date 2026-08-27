@@ -1,0 +1,95 @@
+Component 1: Catchment & gauge selection
+
+Pull candidate gauges from EPA hydrometric and OPW water-level station networks, prioritising your existing Lee catchment network first.
+Filter to gauges with continuous, quality-flagged records covering at least 2017–present (the Sentinel-1/2 era).
+Target 15–30 catchments for this phase (not 50+, given your Aug–Dec window) — but bias selection toward hydrological diversity (flashy vs. groundwater-buffered, small vs. larger, forested vs. agricultural) rather than picking whichever happen to have the cleanest data, since your leave-one-catchment-out validation needs genuine variety to mean anything.
+Output: a locked gauge list with station IDs, coordinates, and record date ranges.
+
+
+Component 2: Catchment boundary delineation
+Define the drainage polygon for each gauge — this is the spatial link discussed earlier connecting point gauge data to spatial imagery.
+
+Use Copernicus DEM (30m or 90m) with a watershed-delineation tool (e.g. pysheds, WhiteboxTools, or QGIS's built-in hydrology toolbox) seeded at each gauge coordinate.
+Cross-check against OPW/EPA catchment boundary shapefiles if available, rather than trusting DEM delineation blind — errors here corrupt every downstream feature.
+Output: one polygon (GeoJSON/shapefile) per gauge.
+
+Component 3: Label engineering (y)
+Build the normalized, discharge-derived target(s) — this is the "y" side of your X/y pair, and it must be computable purely from discharge/water-level records, no rainfall.
+
+From each gauge's discharge time series, compute, per date:
+Pre-event discharge percentile (rank against that catchment's own historical distribution)
+A standardized flow anomaly (SSI-style, seasonally normalized)
+Recession-decay position / baseflow index as a secondary target
+Multi-task target vector: don't pick just one — carry 2–3 targets forward together (as discussed, this regularizes the small-data problem).
+Output: a per-catchment, per-date label table.
+
+
+==============================================================================================================================================================================================
+Component 4: Satellite data acquisition & preprocessing
+Get clean Sentinel-1/2 imagery clipped to each catchment.
+
+Pull via Copernicus Data Space Ecosystem or Google Earth Engine (GEE is faster for prototyping — batch export catchment-clipped stacks).
+Sentinel-1: GRD, VV+VH, both ascending/descending orbits, radiometrically terrain-corrected.
+Sentinel-2: L2A surface reflectance, cloud-masked (use the scene classification layer or s2cloudless).
+Match acquisition dates as closely as possible to your label dates from Component 3 — this is the "same date" pairing from the diagram.
+Output: per-catchment image stacks, indexed by date and sensor.
+
+==============================================================================================================================================================================================
+Component 5: Foundation-model embedding extraction
+Convert raw imagery into embeddings using pretrained Clay v1.5 and Presto (your two chosen models).
+
+Use each model's published inference pipeline (Clay via its Hugging Face checkpoint + TorchGeo/TerraTorch tooling; Presto via its official repo) — don't reimplement the encoders yourself.
+Run frozen inference first (no fine-tuning) to get a baseline embedding set quickly.
+Set up a LoRA fine-tuning variant in parallel as a second track, since this is your planned Option 2 upgrade.
+Output: one embedding vector per patch, per date, per catchment, for each model.
+
+==============================================================================================================================================================================================
+Component 6: Spatial pooling → catchment-level features
+Collapse many patch embeddings into one vector per catchment per date — the pooling step from the diagram that bridges spatial imagery to a point-matched label.
+
+Start with simple mean pooling across all patches inside the catchment boundary; keep max/attention-pooling as a fallback experiment if mean pooling underperforms.
+Aggregate across nearby dates if exact date matches are sparse (e.g. nearest Sentinel-1/2 acquisition within a ±5 day window).
+Output: the final X — one row per catchment per date, ready to pair with y from Component 3.
+
+==============================================================================================================================================================================================
+Component 7: Baseline models (for comparison, not your main method)
+Build the comparison points that make your main result meaningful.
+
+Hand-crafted indices baseline: NDVI, NDWI/MNDWI, VV/VH backscatter stats → RF/XGBoost regression.
+CDS soil moisture baseline: pull ERA5-Land or ESA CCI SM for each catchment centroid/area-average, same date range → simple regression, as the coarse-but-established reference point.
+From-scratch CNN/Transformer baseline: small ViT or CNN trained end-to-end on your own imagery with no pretraining, to empirically justify the foundation-model choice rather than asserting it.
+Output: three baseline model results, same train/test splits as the main method.
+
+==============================================================================================================================================================================================
+Component 8: Main model — regression head on frozen/fine-tuned embeddings
+Your primary method.
+
+Frozen-embedding variant: linear layer or shallow MLP mapping pooled embedding → multi-task label vector.
+LoRA-fine-tuned variant: same head, but with the encoder's adapter layers unfrozen.
+Train both Clay-based and Presto-based versions separately for comparison.
+Output: trained regression heads, one per (encoder × fine-tuning strategy) combination.
+
+==============================================================================================================================================================================================
+Component 9: Validation
+Rigorous, leak-free evaluation — this is non-negotiable given the small catchment count.
+
+Leave-one-catchment-out as the primary validation scheme.
+Leave-one-region-out as a secondary check if your catchments span more than one hydrological region.
+Data-efficiency curve: retrain on 5, 10, 15, 20... catchments and plot performance vs. count, for both the foundation-model method and the from-scratch baseline — this is your strongest, most citable figure if the hypothesis holds.
+Output: performance tables/plots (RMSE, correlation, NSE-equivalent) across all methods and validation schemes.
+
+==============================================================================================================================================================================================
+Component 10: Interpretability probing
+Address the black-box concern your own PhD abstract raises, so this sub-study doesn't undercut your later interpretability arguments.
+
+Regress individual embedding dimensions (or use SHAP on the regression head) against known physical indices (NDVI, backscatter, CDS soil moisture) to check the embedding is picking up plausible, physically grounded signal rather than spurious correlation.
+Output: a short interpretability section/figure — even a modest one strengthens the paper.
+
+==============================================================================================================================================================================================
+Component 11: Packaging as a GNN-ready module
+Close the loop back to your main PhD — this output must be usable later, not just a standalone result.
+
+Wrap the trained embedding-extraction + regression pipeline as a callable function: given a catchment polygon and a date, return the antecedent-state vector.
+Document the expected input/output interface now, even before Stage-2 GNN development starts, so integration later is a plug-in, not a rebuild.
+Output: a documented, reusable antecedent-state estimation module.
+==============================================================================================================================================================================================

@@ -1,0 +1,40 @@
+# -- API Settings --------------------------------------------------------------
+api:
+  base_url: "https://waterlevel.ie"
+  waterlevel_zip_url: "https://waterlevel.ie/hydro-data/data/internet/stations/0/{station_no}/S/Waterlevel_complete.zip"
+  rainfall_zip_url:   "https://waterlevel.ie/hydro-data/data/internet/stations/0/{station_no}/Precip/Rainfall_complete.zip"
+  discharge_zip_url:   "https://waterlevel.ie/hydro-data/data/internet/stations/0/{station_no}/Q/Discharge_complete.zip"
+  zip_entry_name: "tsvalues.csv"
+  timeout: 120
+  max_retries: 3
+  retry_backoff: 2.0
+  rate_limit_delay: 1.0
+
+station_overview: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/config/station_overview_table.csv"
+
+# -- Output --------------------------------------------------------------------
+output:
+  raw_water_level_dir: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/dataset/raw/water_level"
+  metadata_dir:        "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/dataset/metadata"
+  processed_dir:       "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/dataset/processed"
+
+# -- Processing ----------------------------------------------------------------
+processing:
+  resample_freq: "15min"
+  hourly_freq: "h"
+
+# -- Data Quality --------------------------------------------------------------
+quality:
+  good_quality_code: 254
+  max_gap_hours: 6
+  min_record_fraction: 0.7
+  water_level_range: [0, 125]   # mAOD; covers full catchment range
+
+# -- Logging -------------------------------------------------------------------
+logging:
+  downloader:
+    level: "INFO"
+    log_file: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/logs/downloader.log"
+  train:
+    level: "INFO"
+    log_file: "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/logs/train.log"

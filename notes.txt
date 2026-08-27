@@ -1,0 +1,25 @@
+
+python .\src\match_stations_to_catchments.py --availability
+
+
+python src/acquire_sentinel_imagery_cdse.py --catchment-list dataset/metadata/catchment_level_shortlist.csv --shapefile config/shapefiles/subcatchments/subcatchments.shp --station-id-filter 11001 --year 2023 --out-manifest output/cdse_manifest_test.csv
+
+
+python src/download_cdse_results.py --manifest ./output/cdse_manifest_test.csv --out-dir ./output/sentinel_imagery_test
+
+
+
+python src/acquire_sentinel_imagery_cdse.py --catchment-list dataset/metadata/catchment_level_shortlist.csv --shapefile config/shapefiles/subcatchments/subcatchments.shp --station-id-filter 11001 --year 2023 --out-manifest output/cdse_manifest_test2.csv
+
+python src/download_cdse_results.py --manifest output/cdse_manifest_test2.csv --out-dir ./output/sentinel_imagery_test2
+
+
+python src/acquire_sentinel_imagery_cdse.py --catchment-list dataset/metadata/catchment_level_shortlist.csv --shapefile config/shapefiles/subcatchments/subcatchments.shp --station-id-filter 11001 --year 2023 --out-manifest output/cdse_manifest_test3.csv
+
+python src/acquire_sentinel_imagery_cdse.py --catchment-list dataset/metadata/catchment_level_shortlist.csv --shapefile config/shapefiles/subcatchments/subcatchments.shp --list-file-formats
+
+python src/acquire_sentinel_imagery_cdse.py --catchment-list dataset/metadata/catchment_level_shortlist.csv --shapefile config/shapefiles/subcatchments/subcatchments.shp --station-id-filter 11001 --year 2023 --out-manifest output/cdse_manifest_test4.csv
+
+python src/download_cdse_results.py --manifest output/cdse_manifest_test4.csv --out-dir ./output/sentinel_imagery_test4
+
+python src/run_catchment_pipeline.py --catchment-list dataset/metadata/catchment_level_shortlist.csv --shapefile config/shapefiles/subcatchments/subcatchments.shp --year 2023 --embeddings-out-dir ./embeddings_permanent --tmp-download-dir ./tmp_downloads --encoder dummy --station-id-filter 11001
