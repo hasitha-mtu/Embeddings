@@ -10,7 +10,7 @@ api:
   retry_backoff: 2.0
   rate_limit_delay: 1.0
 
-station_overview: "config/station_overview_table.csv"
+station_overview: "dataset/metadata/station_overview_table.csv"
 
 # -- Output --------------------------------------------------------------------
 output:
