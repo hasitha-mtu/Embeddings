@@ -51,7 +51,6 @@ Requires: pandas, numpy, scipy  (pip install pandas numpy scipy)
 import argparse
 import glob
 import os
-import re
 import sys
 
 import numpy as np

@@ -27,13 +27,11 @@ Requires: pandas, geopandas, shapely  (pip install pandas geopandas shapely)
 """
 
 import argparse
-import re
-import sys
 
 import geopandas as gpd
 import pandas as pd
 
-OUTPUT_PATH = "C:\\Users\AdikariAdikari\PycharmProjects\Embeddings\dataset\metadata"
+OUTPUT_PATH = "dataset\metadata"
 
 
 def load_overview(path):
