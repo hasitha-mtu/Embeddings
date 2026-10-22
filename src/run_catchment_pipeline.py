@@ -5,8 +5,11 @@ Ties together acquire_sentinel_imagery_cdse.py, download_cdse_results.py, and
 extract_embeddings.py into one per-catchment loop:
 
     for each catchment:
-        1. submit CDSE acquisition jobs (S1 + S2, one target year)
-        2. poll until jobs finish, download results
+        1. if raw imagery for this catchment is already on disk, skip
+           straight to step 3 -- otherwise:
+           1a. submit CDSE acquisition jobs (S1 + S2, one target year)
+           1b. poll until jobs finish, download results
+        2. (folded into 1)
         3. extract_embeddings.py on the downloaded imagery
         4. VERIFY the output looks sane
         5. only if verification passes: delete the raw downloaded imagery
@@ -14,6 +17,21 @@ extract_embeddings.py into one per-catchment loop:
 
 So peak local disk usage stays around one (or a few) catchment's worth of
 raw imagery, not the full ~1 TB for all 36 catchments at once.
+
+RESUME / ALREADY-DOWNLOADED HANDLING: before submitting or polling anything
+for a catchment, the script checks whether that catchment's imagery is
+already sitting on disk in --tmp-download-dir -- either because a previous
+run got through acquisition/download but was interrupted before extraction,
+or because you downloaded it out-of-band. When that's true it skips
+acquisition submission AND the download-polling wait entirely and goes
+straight to extraction. This is checked in two places: (a) before the
+lookahead submits the *next* catchment's jobs (no point re-submitting to
+CDSE for imagery you already have), and (b) before processing the *current*
+catchment (no point polling a manifest for jobs that already finished).
+Detection is manifest-first (every row DOWNLOADED), falling back to "the
+expected s1_*/s2_* folders already contain .tif files" if the manifest is
+missing but files are still there. Use --force-redownload to disable this
+and always re-submit/re-poll from scratch.
 
 LOOKAHEAD: rather than fully serializing (wait for catchment N's downloads
 to finish before even submitting catchment N+1's jobs), this submits
@@ -45,6 +63,11 @@ Usage:
 
     # Test on one catchment first:
     python run_catchment_pipeline.py ... --station-id-filter 11001
+
+    # Imagery for this catchment was already downloaded in a prior run --
+    # the script auto-detects this and skips straight to extraction. To
+    # force a fresh acquisition/download anyway:
+    python run_catchment_pipeline.py ... --force-redownload
 """
 
 import argparse
@@ -58,6 +81,7 @@ import numpy as np
 import pandas as pd
 
 from download_cdse_results import download_data
+from extract_embeddings import extract_embeddings
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -84,15 +108,31 @@ def submit_acquisition(catchment_list, shapefile, station_id, year, manifest_pat
     return run_cmd(cmd, "acquisition submit")
 
 
+def images_already_downloaded(tmp_dir_for_this_catchment, station_id, year):
+    print(f"    Downloading images for catchment {station_id}-{year}")
+    print(f"tmp_dir_for_this_catchment: {tmp_dir_for_this_catchment}")
+    manifest_path = os.path.join(tmp_dir_for_this_catchment, "manifest.csv")
+    if os.path.exists(manifest_path):
+        try:
+            df = pd.read_csv(manifest_path, dtype=str)
+            if len(df) > 0 and (df["status"] == "DOWNLOADED").all():
+                return True
+        except Exception as e:
+            print(f"    FAILED ({manifest_path}):\n{e.format_exc()}")
+            pass  # fall through to the filesystem check below
+
+    for sensor in ["s1", "s2"]:
+        input_dir = os.path.join(tmp_dir_for_this_catchment, f"{sensor}_{station_id}_{year}")
+        print(f"input_dir: {input_dir}")
+        if os.path.isdir(input_dir):
+            has_tifs = any(f.endswith(".tif") for f in os.listdir(input_dir))
+            if has_tifs:
+                return True
+    return False
+
+
 def wait_and_download(manifest_path, out_dir, client_id, client_secret,
                        poll_interval_sec=60, timeout_sec=3600 * 4):
-    # download_cmd = [
-    #     sys.executable, os.path.join(SCRIPT_DIR, "download_cdse_results.py"),
-    #     "--manifest", manifest_path, "--out-dir", out_dir,
-    # ]
-    # if client_id and client_secret:
-    #     download_cmd += ["--client-id", client_id, "--client-secret", client_secret]
-
     elapsed = 0
     while elapsed < timeout_sec:
         # run_cmd(download_cmd, "download poll")
@@ -115,13 +155,10 @@ def wait_and_download(manifest_path, out_dir, client_id, client_secret,
 
 
 def extract(input_dir, shapefile, subcatchment_id, sensor, encoder, out_embeddings, out_indices):
-    cmd = [
-        sys.executable, os.path.join(SCRIPT_DIR, "extract_embeddings.py"),
-        "--input-dir", input_dir, "--shapefile", shapefile,
-        "--subcatchment-id", str(subcatchment_id), "--sensor", sensor,
-        "--encoder", encoder, "--out-embeddings", out_embeddings, "--out-indices", out_indices,
-    ]
-    return run_cmd(cmd, f"extract {sensor}")
+    result = extract_embeddings(sensor, input_dir, shapefile, subcatchment_id, encoder,
+                   out_embeddings, out_indices)
+    print(f"Extract finished|results: {result}")
+    return result
 
 
 def verify_output(embeddings_path, indices_path, min_expected_dates=5):
@@ -154,16 +191,6 @@ def process_one_catchment(row, args, tmp_dir_for_this_catchment):
     station_id = row["station_id"]
     subcatchment_id = row["subcatchment_id"]
     print(f"\n=== Catchment {catchment_id} (station {station_id}) ===")
-
-    manifest_path = os.path.join(tmp_dir_for_this_catchment, "manifest.csv")
-    print("  [1/4] waiting for acquisition jobs + downloading...")
-    ok = wait_and_download(manifest_path, tmp_dir_for_this_catchment,
-                            args.client_id, args.client_secret,
-                            poll_interval_sec=args.poll_interval_sec, timeout_sec=args.timeout_sec)
-    if not ok:
-        print(f"  ABORTED for catchment {catchment_id}: acquisition/download did not complete cleanly. "
-              f"Raw folder (if any) left in place at {tmp_dir_for_this_catchment} for manual inspection.")
-        return False
 
     os.makedirs(args.embeddings_out_dir, exist_ok=True)
     all_ok = True
@@ -228,6 +255,11 @@ def main():
     parser.add_argument("--timeout-sec", type=int, default=3600 * 4)
     parser.add_argument("--keep-sample-dates", type=int, default=3,
                          help="Number of raw files per catchment/sensor to keep permanently for visual QA (0 to disable)")
+    parser.add_argument("--force-redownload", action="store_true",
+                         help="Always re-submit acquisition jobs and re-poll/download, even if this "
+                              "catchment's imagery already appears on disk in --tmp-download-dir. "
+                              "Default behavior is to detect already-downloaded imagery and skip "
+                              "straight to extraction.")
     args = parser.parse_args()
 
     catchments = pd.read_csv(args.catchment_list)
@@ -247,24 +279,17 @@ def main():
 
     print(f"Processing {len(catchments)} catchment(s) for year {args.year}.")
 
-    # Submit catchment 0's jobs before the loop starts, so the loop body can
-    # always submit catchment i+1 while it processes/deletes catchment i --
-    # this is the lookahead that recovers most of sequential processing's
-    # lost server-side parallelism.
-    print("\nSubmitting acquisition jobs for catchment 0...")
-    submit_acquisition(args.catchment_list, args.shapefile, catchments.iloc[0]["station_id"],
-                        args.year, os.path.join(catchment_tmp_dirs[0], "manifest.csv"),
-                        args.client_id, args.client_secret)
-
     results = []
     for i, row in catchments.iterrows():
-        if i + 1 < len(catchments):
-            next_row = catchments.iloc[i + 1]
-            print(f"\nSubmitting acquisition jobs for catchment {i + 1} "
-                  f"(station {next_row['station_id']}) -- overlapping with catchment {i}'s processing...")
-            submit_acquisition(args.catchment_list, args.shapefile, next_row["station_id"],
-                                args.year, os.path.join(catchment_tmp_dirs[i + 1], "manifest.csv"),
-                                args.client_id, args.client_secret)
+        station_id = row["station_id"]
+        if args.force_redownload or not images_already_downloaded(catchment_tmp_dirs[i], station_id, args.year):
+            manifest_path = os.path.join(catchment_tmp_dirs[i], "manifest.csv")
+            wait_and_download(manifest_path, catchment_tmp_dirs[i],
+                              args.client_id, args.client_secret,
+                              poll_interval_sec=args.poll_interval_sec, timeout_sec=args.timeout_sec)
+        else:
+            print(f"\nCatchment {i + 1}'s (station {station_id}) imagery already on disk "
+                  f"-- skipping acquisition submission.")
 
         ok = process_one_catchment(row, args, catchment_tmp_dirs[i])
         results.append({"station_id": row["station_id"], "success": ok})
