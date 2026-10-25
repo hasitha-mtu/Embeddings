@@ -23,16 +23,16 @@ ENCODER HONESTY NOTE:
   - DummyEncoder (mean+std per band) is the only encoder that has been
     tested end-to-end -- it validates that the whole pipeline (masking,
     tiling, pooling, I/O) works correctly, via synthetic-GeoTIFF tests.
-  - ClayEncoder: checkpoint LOADING is real and verified (Clay v1.5 is
-    loaded via `ClayMAEModule.load_from_checkpoint`, per Clay's own repo/
-    model card, made-with-clay/Clay on Hugging Face). The forward pass
-    (`encode_batch`) -- specifically how the "datacube" dict is assembled
-    (pixels + band wavelengths + GSD + time + lat/lon encoding, and which
-    output token(s) to pool) -- is BEST EFFORT / UNVERIFIED. I have no
-    network access to run Clay's example notebook from this environment.
-    Confirm the datacube packaging and output shape against Clay's current
-    example notebook (https://github.com/Clay-foundation/model) before
-    trusting real numbers out of this path.
+  - ClayEncoder: checkpoint LOADING works on your machine (you reached the
+    forward pass). The forward pass is now sensor-aware: it reads the band
+    wavelengths / normalization mean+std / GSD for the right platform from
+    Clay's own metadata.yaml instead of assuming Sentinel-2. Three details
+    are still written from my recollection of Clay's embedding examples, not
+    verified against the live repo (no network access to it from here), and
+    are marked UNVERIFIED in the class: (a) loading with mask_ratio=0.0 /
+    shuffle=False, (b) taking the CLS token as the embedding, (c) the
+    time/latlon conditioning vectors (still zero placeholders). Confirm
+    against Clay's current example notebook before trusting the numbers.
   - PrestoEncoder: checkpoint LOADING is real and verified
     (`Presto.load_pretrained()`, bundled weights at
     nasaharvest/presto/data/default_model.pt). Its `encode_batch` is
@@ -47,15 +47,16 @@ Usage (dummy encoder, to test the pipeline):
         --out-embeddings embeddings_11001_s2_2023.npz \
         --out-indices indices_11001_s2_2023.csv
 
-Usage (Clay, once you've verified the forward pass against Clay's docs):
+Usage (Clay):
     python extract_embeddings.py ... --encoder clay \
-        --clay-checkpoint /path/to/clay-v1.5.ckpt
+        --clay-checkpoint /path/to/clay-v1.5.ckpt \
+        --clay-metadata /path/to/clay/configs/metadata.yaml
 
 Requires: numpy, pandas, rasterio, shapely, geopandas
-Optional (only if using --encoder clay/presto): torch, and the model's own
-package (claymodel / presto). These are imported lazily, inside the encoder
-classes, so the dummy-encoder path works even if claymodel/presto aren't
-installed.
+Optional (only if using --encoder clay/presto): torch, pyyaml, and the
+model's own package (claymodel / presto). These are imported lazily, inside
+the encoder classes, so the dummy-encoder path works even if claymodel/presto
+aren't installed.
 """
 
 import argparse
@@ -68,15 +69,15 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
-from claymodel.module import ClayMAEModule
 from rasterio.features import geometry_mask
 
-MODEL_METADATA_PATH = "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/checkpoints/clay/configs/metadata.yaml"
-
-# NOTE: no module-level `from claymodel.module import ClayMAEModule` here on
+# NOTE: no module-level `from claymodel.module import ClayMAEModule` on
 # purpose -- that import lives inside ClayEncoder.__init__ so this script
 # still runs (e.g. with --encoder dummy) on a machine that doesn't have the
 # claymodel package installed. Same reasoning for presto in PrestoEncoder.
+
+# Clay's own band/normalization metadata (ships with the Clay repo under configs/).
+MODEL_METADATA_PATH = "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/checkpoints/clay/configs/metadata.yaml"
 
 # SCL classes to exclude as invalid: 0=no data, 1=saturated, 3=cloud shadow,
 # 8/9=cloud medium/high probability, 10=thin cirrus
@@ -85,14 +86,16 @@ SCL_INVALID_CLASSES = {0, 1, 3, 8, 9, 10}
 S2_BAND_ORDER = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"]
 S1_BAND_ORDER = ["VV", "VH"]
 
-# Sentinel-2 center wavelengths (micrometers) for the bands in S2_BAND_ORDER
-# (excluding SCL, which isn't a spectral band). Confirmed values, used by
-# ClayEncoder to build the "wavelengths" part of Clay's datacube input.
-S2_BAND_WAVELENGTHS_UM = {
-    "B02": 0.492, "B03": 0.560, "B04": 0.665, "B05": 0.704, "B06": 0.741,
-    "B07": 0.783, "B08": 0.833, "B8A": 0.865, "B11": 1.614, "B12": 2.202,
+# How this pipeline's band names map onto the band names used in Clay's
+# metadata.yaml, per platform. (Band names in the yaml are looked up by name,
+# not by position, so the order of the yaml's own band_order doesn't matter.)
+CLAY_PLATFORM = {"s1": "sentinel-1-rtc", "s2": "sentinel-2-l2a"}
+CLAY_BAND_NAMES = {
+    "s1": {"VV": "vv", "VH": "vh"},
+    "s2": {"B02": "blue", "B03": "green", "B04": "red", "B05": "rededge1",
+           "B06": "rededge2", "B07": "rededge3", "B08": "nir", "B8A": "nir08",
+           "B11": "swir16", "B12": "swir22"},
 }
-S2_GSD_METERS = 10.0
 
 
 # --------------------------------------------------------------------------
@@ -125,36 +128,80 @@ class DummyEncoder(BaseEncoder):
         return np.concatenate([means, stds], axis=1)
 
 
+def load_clay_band_metadata(metadata_path, sensor):
+    """Reads (wavelengths, means, stds, gsd) for this pipeline's bands for
+    `sensor` ('s1' or 's2') out of Clay's metadata.yaml, in this pipeline's
+    own band order. Raises a descriptive error if the yaml doesn't have the
+    structure this expects (platform -> bands -> mean/std/wavelength -> name),
+    rather than silently falling back to guessed values.
+    """
+    import yaml
+
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        meta = yaml.safe_load(f)
+
+    platform = CLAY_PLATFORM[sensor]
+    if platform not in meta:
+        raise KeyError(f"platform '{platform}' not found in {metadata_path}; "
+                       f"available top-level keys: {list(meta)}")
+    entry = meta[platform]
+
+    band_map = CLAY_BAND_NAMES[sensor]
+    try:
+        bands = entry["bands"]
+        waves = [float(bands["wavelength"][clay_name]) for clay_name in band_map.values()]
+        means = [float(bands["mean"][clay_name]) for clay_name in band_map.values()]
+        stds = [float(bands["std"][clay_name]) for clay_name in band_map.values()]
+    except KeyError as e:
+        raise KeyError(f"metadata for '{platform}' in {metadata_path} is missing {e}; "
+                       f"expected bands -> wavelength/mean/std -> {list(band_map.values())}. "
+                       f"Found under 'bands': {list(entry.get('bands', {}))}") from e
+    gsd = float(entry.get("gsd", 10.0))
+    return waves, means, stds, gsd
+
+
 class ClayEncoder(BaseEncoder):
-    """Clay v1.5 patch encoder.
+    """Clay v1.5 patch encoder, sensor-aware.
 
-    CHECKPOINT LOADING -- verified against Clay's own repo/model card:
-        from claymodel.module import ClayMAEModule
-        model = ClayMAEModule.load_from_checkpoint(checkpoint_path)
+    WHY `sensor` IS REQUIRED: Clay's patch embedding builds its convolution
+    weights on the fly from the wavelengths of the bands you pass in. If the
+    wavelengths describe 10 bands but the pixels have 2 (or vice versa) the
+    forward pass fails with "expected input[...] to have 10 channels, but got
+    2 channels" -- exactly the error you saw when Sentinel-1 patches were fed
+    with Sentinel-2's 10 wavelengths. So wavelengths, normalization stats and
+    GSD are now looked up per sensor from Clay's metadata.yaml.
 
-    FORWARD PASS -- best effort / UNVERIFIED. Clay's encoder expects a
-    "datacube" dict roughly like:
-        {
-          "pixels":     (B, C, H, W) float tensor, normalized per-band,
-          "time":       (B, 4) encoded [sin(day), cos(day), sin(year), cos(year)],
-          "latlon":     (B, 4) encoded [sin(lat), cos(lat), sin(lon), cos(lon)],
-          "waves":      (C,)  band center wavelengths in micrometers,
-          "gsd":        scalar, ground sample distance in meters,
-        }
-    and returns patch/class tokens from `model.model.encoder(datacube)`
-    (the exact call and which token(s) to pool -- class token vs mean of
-    patch tokens -- needs to be checked against Clay's current example
-    notebook: https://github.com/Clay-foundation/model). Below, `time` and
-    `latlon` are filled with placeholder zero tensors (since this script
-    only has per-tile pixel data, not confirmed date/lat-lon per patch at
-    this point in the pipeline) -- replace with real encodings before
-    trusting the output. This class will run without crashing but its
-    numbers are not yet confirmed correct.
+    CHECKPOINT LOADING -- works (you reached the forward pass):
+        ClayMAEModule.load_from_checkpoint(ckpt, metadata_path=...)
+
+    UNVERIFIED (from my recollection of Clay's embedding examples, not checked
+    against the live repo from here -- confirm in Clay's example notebook):
+      (a) Loading with mask_ratio=0.0 and shuffle=False. Clay is a masked
+          autoencoder; by default it hides most patches, which is wrong when
+          you want an embedding of the whole tile. If your claymodel version
+          doesn't accept these kwargs, loading will raise a TypeError --
+          that is the signal to check the notebook, not to ignore.
+      (b) Using the CLS token (index 0 of the encoder output) as the tile's
+          embedding. The remaining tokens are per-patch features.
+      (c) `time` and `latlon` conditioning vectors are zero placeholders, so
+          embeddings don't yet use acquisition date or location.
+
+    Sentinel-1 is converted to dB before normalization, because (to my
+    recollection) Clay's Sentinel-1 mean/std in metadata.yaml are in dB
+    (means around -12 and -18). CHECK your yaml: if the S1 means are small
+    positive numbers instead, set S1_TO_DB = False below.
     """
 
-    def __init__(self, checkpoint_path, device="cpu"):
+    S1_TO_DB = True
+    DB_FLOOR = 1e-6          # linear floor before log10 (-60 dB), avoids log(0)
+    BATCH_SIZE = 64          # patches per forward pass, bounds memory
+    embedding_dim = 1024     # Clay v1.5 "large"; matches the [1024, ...] weight in your error
+
+    def __init__(self, checkpoint_path, sensor, metadata_path=MODEL_METADATA_PATH, device="cpu"):
         if not checkpoint_path:
             raise ValueError("ClayEncoder requires --clay-checkpoint")
+        if sensor not in CLAY_PLATFORM:
+            raise ValueError(f"sensor must be one of {list(CLAY_PLATFORM)}, got {sensor!r}")
         try:
             import torch
         except ImportError:
@@ -170,46 +217,57 @@ class ClayEncoder(BaseEncoder):
 
         self.torch = torch
         self.device = device
+        self.sensor = sensor
         self.patch_size = 64
-        self.model = ClayMAEModule.load_from_checkpoint(checkpoint_path,
-                                                        metadata_path=MODEL_METADATA_PATH)
+        self.waves_um, self.means, self.stds, self.gsd_m = load_clay_band_metadata(metadata_path, sensor)
+        print(f"  ClayEncoder[{sensor}]: wavelengths={self.waves_um} "
+              f"means={self.means} stds={self.stds} gsd={self.gsd_m}")
+
+        # UNVERIFIED (a): mask_ratio=0.0 / shuffle=False so every patch is encoded.
+        self.model = ClayMAEModule.load_from_checkpoint(
+            checkpoint_path, metadata_path=metadata_path, mask_ratio=0.0, shuffle=False)
         self.model.eval()
         self.model.to(device)
-        # embedding_dim depends on the Clay backbone (ViT) width -- 768 for
-        # the standard Clay v1.5 config. Set after first real forward pass
-        # if this differs; left as a best-effort default here.
-        self.embedding_dim = 768
 
-    def _build_datacube(self, patches, waves_um, gsd_m):
+    def preprocess(self, patches):
+        """(N, C, H, W) raw -> normalized float32 with NaN -> 0 (the dataset
+        mean after normalization). numpy-only so it can be tested without torch."""
+        x = patches.astype("float32", copy=True)
+        if self.sensor == "s1" and self.S1_TO_DB:
+            x = 10.0 * np.log10(np.clip(x, self.DB_FLOOR, None))   # NaN stays NaN
+        mean = np.asarray(self.means, dtype="float32")[None, :, None, None]
+        std = np.asarray(self.stds, dtype="float32")[None, :, None, None]
+        x = (x - mean) / std
+        return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _build_datacube(self, pixels_np):
         torch = self.torch
-        n = patches.shape[0]
-        pixels = torch.from_numpy(np.nan_to_num(patches, nan=0.0)).float().to(self.device)
-        waves = torch.tensor(waves_um, dtype=torch.float32, device=self.device)
-        # Placeholder time/latlon encodings -- UNVERIFIED, see class docstring.
-        time_enc = torch.zeros((n, 4), dtype=torch.float32, device=self.device)
-        latlon_enc = torch.zeros((n, 4), dtype=torch.float32, device=self.device)
+        n = pixels_np.shape[0]
         return {
-            "pixels": pixels,
-            "time": time_enc,
-            "latlon": latlon_enc,
-            "waves": waves,
-            "gsd": torch.tensor(gsd_m, dtype=torch.float32, device=self.device),
+            "pixels": torch.from_numpy(pixels_np).float().to(self.device),
+            # UNVERIFIED (c): zero placeholders, see class docstring.
+            "time": torch.zeros((n, 4), dtype=torch.float32, device=self.device),
+            "latlon": torch.zeros((n, 4), dtype=torch.float32, device=self.device),
+            "waves": torch.tensor(self.waves_um, dtype=torch.float32, device=self.device),
+            "gsd": torch.tensor(self.gsd_m, dtype=torch.float32, device=self.device),
         }
 
-    def encode_batch(self, patches, waves_um=None, gsd_m=S2_GSD_METERS):
-        if waves_um is None:
-            # Assumes S2 band order minus SCL -- pass explicit waves_um for S1.
-            waves_um = [S2_BAND_WAVELENGTHS_UM[b] for b in S2_BAND_ORDER if b != "SCL"]
-        datacube = self._build_datacube(patches, waves_um, gsd_m)
+    def encode_batch(self, patches):
+        if patches.shape[1] != len(self.waves_um):
+            raise ValueError(f"{self.sensor} patches have {patches.shape[1]} channels but the "
+                             f"metadata defines {len(self.waves_um)} bands")
+        x = self.preprocess(patches)
+        outputs = []
         with self.torch.no_grad():
-            # UNVERIFIED: confirm this call signature and which tokens to
-            # pool against Clay's current example notebook before trusting
-            # the output.
-            out = self.model.model.encoder(datacube)
-            if isinstance(out, (tuple, list)):
-                out = out[0]
-            embedding = out.mean(dim=1) if out.dim() == 3 else out
-        return embedding.cpu().numpy()
+            for start in range(0, len(x), self.BATCH_SIZE):
+                datacube = self._build_datacube(x[start:start + self.BATCH_SIZE])
+                out = self.model.model.encoder(datacube)
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+                # UNVERIFIED (b): CLS token as the tile embedding.
+                emb = out[:, 0, :] if out.dim() == 3 else out
+                outputs.append(emb.cpu().numpy())
+        return np.concatenate(outputs, axis=0)
 
 
 class PrestoEncoder(BaseEncoder):
@@ -306,7 +364,11 @@ def build_catchment_mask(shapefile_path, subcatchment_id, transform, crs, shape)
 
 
 def scl_valid_mask(scl_band):
-    valid = np.ones(scl_band.shape, dtype=bool)
+    # read_geotiff turns the file's nodata value into NaN. If the SCL band's
+    # nodata tag is 0, SCL class 0 ("no data") becomes NaN and would slip
+    # through the != checks below as "valid" (NaN != 0 is True), so NaN is
+    # treated as invalid explicitly.
+    valid = ~np.isnan(scl_band)
     for cls in SCL_INVALID_CLASSES:
         valid &= (scl_band != cls)
     return valid
@@ -321,7 +383,8 @@ def compute_s2_indices(array, catchment_mask, valid_mask):
     def safe_index(a, b):
         with np.errstate(divide="ignore", invalid="ignore"):
             idx = (a - b) / (a + b)
-        return np.nanmean(np.where(m, idx, np.nan))
+        vals = idx[m & np.isfinite(idx)]
+        return float(vals.mean()) if vals.size else np.nan
 
     return {
         "ndvi_mean": safe_index(band["B08"], band["B04"]),
@@ -331,17 +394,48 @@ def compute_s2_indices(array, catchment_mask, valid_mask):
     }
 
 
+def s1_valid_mask(array, catchment_mask):
+    """Catchment pixels where BOTH polarizations have real data. Pixels
+    outside the polygon, or in a scene with no coverage, are NaN after
+    read_geotiff and are excluded here."""
+    return catchment_mask & np.isfinite(array[0]) & np.isfinite(array[1])
+
+
+def _to_db(x):
+    return 10.0 * np.log10(np.clip(x, 1e-6, None))
+
+
 def compute_s1_stats(array, catchment_mask):
-    band = {name: array[i] for i, name in enumerate(S1_BAND_ORDER)}
-    m = catchment_mask
-    if m.sum() == 0:
-        return {"vv_mean": np.nan, "vv_std": np.nan, "vh_mean": np.nan, "vh_std": np.nan, "valid_pixel_frac": 0.0}
+    """Hand-crafted S1 baseline features. Backscatter is averaged in dB
+    (per-pixel conversion first), because linear means are dominated by a few
+    very bright pixels. The linear vv_mean/vv_std/vh_mean/vh_std columns are
+    kept unchanged for backward compatibility."""
+    valid = s1_valid_mask(array, catchment_mask)
+    n_catchment = int(catchment_mask.sum())
+    n_valid = int(valid.sum())
+    keys = ["vv_mean", "vv_std", "vh_mean", "vh_std",
+            "vv_db_mean", "vv_db_std", "vv_db_median",
+            "vh_db_mean", "vh_db_std", "vh_db_median"]
+    if n_valid == 0:
+        # No usable S1 data over the catchment on this date.
+        out = {k: np.nan for k in keys}
+        out["valid_pixel_frac"] = 0.0
+        return out
+    vv = array[0][valid]
+    vh = array[1][valid]
+    vv_db, vh_db = _to_db(vv), _to_db(vh)
     return {
-        "vv_mean": float(np.nanmean(np.where(m, band["VV"], np.nan))),
-        "vv_std": float(np.nanstd(np.where(m, band["VV"], np.nan))),
-        "vh_mean": float(np.nanmean(np.where(m, band["VH"], np.nan))),
-        "vh_std": float(np.nanstd(np.where(m, band["VH"], np.nan))),
-        "valid_pixel_frac": 1.0,  # S1 has no cloud concept; catchment mask only
+        "vv_mean": float(vv.mean()),
+        "vv_std": float(vv.std()),
+        "vh_mean": float(vh.mean()),
+        "vh_std": float(vh.std()),
+        "vv_db_mean": float(vv_db.mean()),
+        "vv_db_std": float(vv_db.std()),
+        "vv_db_median": float(np.median(vv_db)),
+        "vh_db_mean": float(vh_db.mean()),
+        "vh_db_std": float(vh_db.std()),
+        "vh_db_median": float(np.median(vh_db)),
+        "valid_pixel_frac": float(n_valid / n_catchment) if n_catchment else 0.0,
     }
 
 
@@ -383,7 +477,8 @@ def process_file(filepath, shapefile_path, subcatchment_id, sensor, encoder):
     else:
         indices = compute_s1_stats(array, catchment_mask)
         encode_array = array
-        final_mask = catchment_mask
+        # Only tile where S1 actually has data, so empty scenes yield 0 patches.
+        final_mask = s1_valid_mask(array, catchment_mask)
 
     patches = tile_patches(encode_array, final_mask, encoder.patch_size)
     n_patches = len(patches)
@@ -398,12 +493,13 @@ def process_file(filepath, shapefile_path, subcatchment_id, sensor, encoder):
     return embedding, indices
 
 
-def build_encoder(encoder_name, sensor, clay_checkpoint=None, presto_checkpoint=None):
+def build_encoder(encoder_name, sensor, clay_checkpoint=None, presto_checkpoint=None,
+                  clay_metadata=MODEL_METADATA_PATH):
     n_bands = len(S2_BAND_ORDER) - 1 if sensor == "s2" else len(S1_BAND_ORDER)
     if encoder_name == "dummy":
         return DummyEncoder(n_bands)
     elif encoder_name == "clay":
-        return ClayEncoder(clay_checkpoint)
+        return ClayEncoder(clay_checkpoint, sensor, metadata_path=clay_metadata)
     elif encoder_name == "presto":
         return PrestoEncoder(presto_checkpoint)
     raise ValueError(f"Unknown encoder: {encoder_name}")
@@ -432,7 +528,8 @@ def run_extraction(sensor, input_dir, shapefile, subcatchment_id, encoder,
             embedding, indices = process_file(fp, shapefile, subcatchment_id, sensor, encoder)
             embeddings[date] = embedding
             rows.append({"date": date, **indices})
-            print(f"  {date}: {indices['n_patches_used']} patches used")
+            print(f"  {date}: {indices['n_patches_used']} patches used, "
+                  f"valid_pixel_frac={indices['valid_pixel_frac']:.2f}")
         except Exception as e:
             print(f"  {date}: ERROR -- {e}")
 
@@ -447,13 +544,14 @@ def run_extraction(sensor, input_dir, shapefile, subcatchment_id, encoder,
 def extract_embeddings(sensor, input_dir, shapefile, subcatchment_id, encoder,
                         out_embeddings, out_indices,
                         clay_checkpoint="checkpoints/clay/clay-v1.5.ckpt",
-                       presto_checkpoint="checkpoints/presto/presto-main/data/default_model.pt"):
+                        presto_checkpoint="checkpoints/presto/presto-main/data/default_model.pt",
+                        clay_metadata=MODEL_METADATA_PATH):
     """Importable entry point (e.g. for run_catchment_pipeline.py) mirroring
     the CLI. `encoder` here is a STRING ("dummy"/"clay"/"presto"), matching
     the --encoder CLI flag -- this function builds the actual encoder
     instance for you, same as main() does.
     """
-    encoder_instance = build_encoder(encoder, sensor, clay_checkpoint, presto_checkpoint)
+    encoder_instance = build_encoder(encoder, sensor, clay_checkpoint, presto_checkpoint, clay_metadata)
     return run_extraction(sensor, input_dir, shapefile, subcatchment_id,
                            encoder_instance, out_embeddings, out_indices)
 
@@ -466,12 +564,14 @@ def main():
     parser.add_argument("--sensor", required=True, choices=["s1", "s2"])
     parser.add_argument("--encoder", default="dummy", choices=["dummy", "clay", "presto"])
     parser.add_argument("--clay-checkpoint", default="checkpoints/clay/clay-v1.5.ckpt")
+    parser.add_argument("--clay-metadata", default=MODEL_METADATA_PATH)
     parser.add_argument("--presto-checkpoint", default="checkpoints/presto/presto-main/data/default_model.pt")
     parser.add_argument("--out-embeddings", required=True)
     parser.add_argument("--out-indices", required=True)
     args = parser.parse_args()
 
-    encoder = build_encoder(args.encoder, args.sensor, args.clay_checkpoint, args.presto_checkpoint)
+    encoder = build_encoder(args.encoder, args.sensor, args.clay_checkpoint,
+                            args.presto_checkpoint, args.clay_metadata)
     run_extraction(args.sensor, args.input_dir, args.shapefile, args.subcatchment_id,
                     encoder, args.out_embeddings, args.out_indices)
 

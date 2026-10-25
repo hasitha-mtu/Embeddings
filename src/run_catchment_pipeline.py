@@ -18,6 +18,12 @@ extract_embeddings.py into one per-catchment loop:
 So peak local disk usage stays around one (or a few) catchment's worth of
 raw imagery, not the full ~1 TB for all 36 catchments at once.
 
+SKIP-IF-DONE: a catchment is skipped entirely (no CDSE polling, no extraction)
+when every sensor in --sensors already has permanent embeddings + indices
+output that passes verify_output(). Use --reprocess to redo, e.g. after
+changing extract_embeddings.py. A requested sensor with no raw folder and no
+verified output now counts as a FAILURE (raw imagery is kept, not deleted).
+
 RESUME / ALREADY-DOWNLOADED HANDLING: before submitting or polling anything
 for a catchment, the script checks whether that catchment's imagery is
 already sitting on disk in --tmp-download-dir -- either because a previous
@@ -73,9 +79,9 @@ Usage:
 import argparse
 import os
 import shutil
-import subprocess
 import sys
 import time
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -86,29 +92,8 @@ from extract_embeddings import extract_embeddings
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def run_cmd(cmd, description):
-    print(f"    $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"    FAILED ({description}):\n{result.stdout}\n{result.stderr}")
-        return False
-    return True
 
-
-def submit_acquisition(catchment_list, shapefile, station_id, year, manifest_path,
-                        client_id, client_secret):
-    cmd = [
-        sys.executable, os.path.join(SCRIPT_DIR, "acquire_sentinel_imagery_cdse.py"),
-        "--catchment-list", catchment_list, "--shapefile", shapefile,
-        "--station-id-filter", str(station_id), "--year", str(year),
-        "--out-manifest", manifest_path,
-    ]
-    if client_id and client_secret:
-        cmd += ["--client-id", client_id, "--client-secret", client_secret]
-    return run_cmd(cmd, "acquisition submit")
-
-
-def images_already_downloaded(tmp_dir_for_this_catchment, station_id, year):
+def images_already_downloaded(tmp_dir_for_this_catchment, station_id, year, min_images=5):
     print(f"    Downloading images for catchment {station_id}-{year}")
     print(f"tmp_dir_for_this_catchment: {tmp_dir_for_this_catchment}")
     manifest_path = os.path.join(tmp_dir_for_this_catchment, "manifest.csv")
@@ -117,16 +102,19 @@ def images_already_downloaded(tmp_dir_for_this_catchment, station_id, year):
             df = pd.read_csv(manifest_path, dtype=str)
             if len(df) > 0 and (df["status"] == "DOWNLOADED").all():
                 return True
+            return False   # manifest exists but some jobs are not DOWNLOADED: not ready
         except Exception as e:
-            print(f"    FAILED ({manifest_path}):\n{e.format_exc()}")
-            pass  # fall through to the filesystem check below
+            print(f"    FAILED reading {manifest_path}: {e}\n{traceback.format_exc()}")
+            # fall through to the filesystem check below
 
     for sensor in ["s1", "s2"]:
         input_dir = os.path.join(tmp_dir_for_this_catchment, f"{sensor}_{station_id}_{year}")
         print(f"input_dir: {input_dir}")
         if os.path.isdir(input_dir):
-            has_tifs = any(f.endswith(".tif") for f in os.listdir(input_dir))
-            if has_tifs:
+            n_tifs = sum(f.endswith(".tif") for f in os.listdir(input_dir))
+            print(f"    {sensor}: {n_tifs} .tif files found")
+            # A stray file or two is not a finished download.
+            if n_tifs >= min_images:
                 return True
     return False
 
@@ -135,7 +123,6 @@ def wait_and_download(manifest_path, out_dir, client_id, client_secret,
                        poll_interval_sec=60, timeout_sec=3600 * 4):
     elapsed = 0
     while elapsed < timeout_sec:
-        # run_cmd(download_cmd, "download poll")
         print("download poll")
         download_data(manifest_path, out_dir, client_id, client_secret)
         if not os.path.exists(manifest_path):
@@ -186,6 +173,22 @@ def verify_output(embeddings_path, indices_path, min_expected_dates=5):
     return True, f"{n_dates} dates, {all_nan_dates} all-NaN"
 
 
+def output_paths(embeddings_out_dir, station_id, sensor, year):
+    return (os.path.join(embeddings_out_dir, f"embeddings_{station_id}_{sensor}_{year}.npz"),
+            os.path.join(embeddings_out_dir, f"indices_{station_id}_{sensor}_{year}.csv"))
+
+
+def already_extracted(args, station_id, sensors):
+    """True only if EVERY requested sensor already has permanent output that
+    passes verify_output(). Used to skip a catchment entirely on rerun."""
+    for sensor in sensors:
+        out_emb, out_idx = output_paths(args.embeddings_out_dir, station_id, sensor, args.year)
+        passed, detail = verify_output(out_emb, out_idx)
+        if not passed:
+            return False
+    return True
+
+
 def process_one_catchment(row, args, tmp_dir_for_this_catchment):
     catchment_id = row.get("catchment_id", row.get("subcatchment_id"))
     station_id = row["station_id"]
@@ -194,26 +197,38 @@ def process_one_catchment(row, args, tmp_dir_for_this_catchment):
 
     os.makedirs(args.embeddings_out_dir, exist_ok=True)
     all_ok = True
-    for sensor in ["s1", "s2"]:
-        input_dir = os.path.join(tmp_dir_for_this_catchment, f"{sensor}_{station_id}_{args.year}")
-        if not os.path.isdir(input_dir):
-            print(f"  [2/4] no {sensor} folder found for station {station_id} -- skipping this sensor")
+    for sensor in args.sensors:
+        out_emb, out_idx = output_paths(args.embeddings_out_dir, station_id, sensor, args.year)
+        if not args.reprocess and verify_output(out_emb, out_idx)[0]:
+            print(f"  [2/4] {sensor}: verified output already exists -- skipping")
             continue
 
-        out_emb = os.path.join(args.embeddings_out_dir, f"embeddings_{station_id}_{sensor}_{args.year}.npz")
-        out_idx = os.path.join(args.embeddings_out_dir, f"indices_{station_id}_{sensor}_{args.year}.csv")
+        input_dir = os.path.join(tmp_dir_for_this_catchment, f"{sensor}_{station_id}_{args.year}")
+        if not os.path.isdir(input_dir):
+            # A requested sensor with no raw data is a failure, not a silent skip
+            # (previously this still reported success, e.g. S2 for 11001).
+            print(f"  [2/4] no {sensor} folder found for station {station_id} -- NOT extracted")
+            all_ok = False
+            continue
 
+        # Write to temporary names first and only replace the permanent output
+        # once the new files verify, so a bad run can never overwrite good output.
+        tmp_emb = out_emb[:-4] + ".tmp.npz"
+        tmp_idx = out_idx[:-4] + ".tmp.csv"
         print(f"  [2/4] extracting {sensor} embeddings...")
-        if not extract(input_dir, args.shapefile, subcatchment_id, sensor, args.encoder, out_emb, out_idx):
+        if not extract(input_dir, args.shapefile, subcatchment_id, sensor, args.encoder, tmp_emb, tmp_idx):
             all_ok = False
             continue
 
         print("  [3/4] verifying output...")
-        passed, detail = verify_output(out_emb, out_idx)
+        passed, detail = verify_output(tmp_emb, tmp_idx)
         print(f"    {'PASS' if passed else 'FAIL'}: {detail}")
         if not passed:
+            print(f"    new output left at {tmp_emb} / {tmp_idx}; existing permanent output (if any) NOT replaced")
             all_ok = False
             continue
+        os.replace(tmp_emb, out_emb)
+        os.replace(tmp_idx, out_idx)
 
         if args.keep_sample_dates > 0:
             _keep_sample(input_dir, args.embeddings_out_dir, station_id, sensor, args.keep_sample_dates)
@@ -255,12 +270,21 @@ def main():
     parser.add_argument("--timeout-sec", type=int, default=3600 * 4)
     parser.add_argument("--keep-sample-dates", type=int, default=3,
                          help="Number of raw files per catchment/sensor to keep permanently for visual QA (0 to disable)")
+    parser.add_argument("--sensors", default="s1,s2",
+                         help="Comma-separated sensors to process, e.g. 's1' for Sentinel-1 only")
+    parser.add_argument("--reprocess", action="store_true",
+                         help="Re-extract even if verified output already exists for a sensor "
+                              "(use after changing the extractor).")
     parser.add_argument("--force-redownload", action="store_true",
                          help="Always re-submit acquisition jobs and re-poll/download, even if this "
                               "catchment's imagery already appears on disk in --tmp-download-dir. "
                               "Default behavior is to detect already-downloaded imagery and skip "
                               "straight to extraction.")
     args = parser.parse_args()
+    args.sensors = [x.strip().lower() for x in args.sensors.split(",") if x.strip()]
+    bad = [x for x in args.sensors if x not in ("s1", "s2")]
+    if bad or not args.sensors:
+        parser.error(f"--sensors must be a comma-separated subset of s1,s2 (got {args.sensors})")
 
     catchments = pd.read_csv(args.catchment_list)
     if args.station_id_filter:
@@ -282,6 +306,11 @@ def main():
     results = []
     for i, row in catchments.iterrows():
         station_id = row["station_id"]
+        if not args.reprocess and already_extracted(args, station_id, args.sensors):
+            print(f"\nStation {station_id}: verified output already exists for "
+                  f"{','.join(args.sensors)} {args.year} -- skipping (use --reprocess to redo).")
+            results.append({"station_id": station_id, "success": True})
+            continue
         if args.force_redownload or not images_already_downloaded(catchment_tmp_dirs[i], station_id, args.year):
             manifest_path = os.path.join(catchment_tmp_dirs[i], "manifest.csv")
             wait_and_download(manifest_path, catchment_tmp_dirs[i],
