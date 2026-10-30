@@ -33,11 +33,15 @@ ENCODER HONESTY NOTE:
     shuffle=False, (b) taking the CLS token as the embedding, (c) the
     time/latlon conditioning vectors (still zero placeholders). Confirm
     against Clay's current example notebook before trusting the numbers.
-  - PrestoEncoder: checkpoint LOADING is real and verified
-    (`Presto.load_pretrained()`, bundled weights at
-    nasaharvest/presto/data/default_model.pt). Its `encode_batch` is
-    DELIBERATELY left unimplemented -- see the class docstring below for
-    why this is an architecture mismatch, not just missing code.
+  - Presto is NOT run from this script. It encodes a per-location time series, not a
+    single-date tile, so it runs from the compact pixel cache this script now writes
+    (see pixel_cache.py) via extract_presto.py. Nothing about Presto lives here.
+
+PIXEL CACHE: while it reads each date's raster, this script can also write a small
+permanent cache of sampled-pixel values (pixel_cache.py), so a later encoder never
+needs the raw imagery again. It is written by the same pass, to the same temp-then-
+replace rules as the embeddings (see run_catchment_pipeline.py). With no encoder
+(cache-only mode) it writes just the cache and the per-date statistics.
 
 Usage (dummy encoder, to test the pipeline):
     python extract_embeddings.py \
@@ -46,6 +50,8 @@ Usage (dummy encoder, to test the pipeline):
         --sensor s2 --encoder dummy \
         --out-embeddings embeddings_11001_s2_2023.npz \
         --out-indices indices_11001_s2_2023.csv
+    (--out-* are optional: without them a standalone run writes to
+     <results root>/checks/, see project_paths.py)
 
 Usage (Clay):
     python extract_embeddings.py ... --encoder clay \
@@ -53,10 +59,9 @@ Usage (Clay):
         --clay-metadata /path/to/clay/configs/metadata.yaml
 
 Requires: numpy, pandas, rasterio, shapely, geopandas
-Optional (only if using --encoder clay/presto): torch, pyyaml, and the
-model's own package (claymodel / presto). These are imported lazily, inside
-the encoder classes, so the dummy-encoder path works even if claymodel/presto
-aren't installed.
+Optional (only if using --encoder clay): torch, pyyaml, and the model's own
+package (claymodel). These are imported lazily, inside the encoder classes, so
+the dummy-encoder path works even if claymodel isn't installed.
 """
 
 import argparse
@@ -71,10 +76,12 @@ import pandas as pd
 import rasterio
 from rasterio.features import geometry_mask
 
+from pixel_cache import PixelCacheBuilder
+
 # NOTE: no module-level `from claymodel.module import ClayMAEModule` on
 # purpose -- that import lives inside ClayEncoder.__init__ so this script
 # still runs (e.g. with --encoder dummy) on a machine that doesn't have the
-# claymodel package installed. Same reasoning for presto in PrestoEncoder.
+# claymodel package installed.
 
 # Clay's own band/normalization metadata (ships with the Clay repo under configs/).
 MODEL_METADATA_PATH = "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/checkpoints/clay/configs/metadata.yaml"
@@ -99,8 +106,8 @@ CLAY_BAND_NAMES = {
 
 
 # --------------------------------------------------------------------------
-# Encoders -- pluggable. DummyEncoder is tested; Clay/Presto have verified
-# checkpoint loading but differ in forward-pass maturity (see class docs).
+# Encoders -- pluggable. DummyEncoder is tested; Clay has verified checkpoint
+# loading with a few forward-pass details still unverified (see class docs).
 # --------------------------------------------------------------------------
 
 class BaseEncoder:
@@ -270,72 +277,6 @@ class ClayEncoder(BaseEncoder):
         return np.concatenate(outputs, axis=0)
 
 
-class PrestoEncoder(BaseEncoder):
-    """Presto pixel-timeseries encoder.
-
-    CHECKPOINT LOADING -- verified against nasaharvest/presto:
-        from presto import Presto
-        encoder_decoder = Presto.load_pretrained()   # loads the bundled
-                                                       # data/default_model.pt
-
-    ARCHITECTURAL MISMATCH (not just an unverified detail): Presto is built
-    to encode a per-pixel-location TIME SERIES (a sequence of observations
-    across dates for one point), not a single-date spatial tile the way
-    this script's `process_file()` works (one GeoTIFF = one date = a grid
-    of patches). Feeding Presto a one-date spatial patch would require
-    either (a) faking a length-1 timeseries per pixel/patch, which throws
-    away exactly the temporal signal Presto is designed around, or (b)
-    restructuring this script so it assembles, per catchment location, the
-    sequence of values across all available dates before calling Presto
-    once per location -- a real pipeline change, not a bug fix.
-
-    Two ways to resolve this, left as a design decision rather than
-    guessed at here:
-      1. Restructure extraction to build per-pixel (or per-small-patch)
-         time series across the full date range for a catchment, then call
-         Presto once per series. Bigger change, but uses Presto as intended.
-      2. Use Clay only for now (Clay is a single-timestep spatial encoder,
-         which matches this script's current per-date-tile design), and
-         revisit Presto once/if the pipeline is restructured to be
-         timeseries-first.
-
-    `encode_batch` is deliberately left raising NotImplementedError below
-    until that decision is made -- it should not silently return wrong
-    numbers for a shape it was never designed to take.
-    """
-
-    def __init__(self, checkpoint_path=None, device="cpu"):
-        try:
-            import torch  # noqa: F401
-        except ImportError:
-            raise RuntimeError("PrestoEncoder requires torch -- pip install torch")
-        try:
-            from presto import Presto
-        except ImportError:
-            raise RuntimeError(
-                "PrestoEncoder requires the presto package -- "
-                "pip install git+https://github.com/nasaharvest/presto.git"
-            )
-
-        self.device = device
-        self.patch_size = 64
-        # Verified: loads Presto's bundled pretrained weights.
-        self.model = Presto.load_pretrained()
-        self.model.eval()
-        self.model.to(device)
-        self.embedding_dim = None  # depends on how encode_batch ends up structured
-
-    def encode_batch(self, patches):
-        raise NotImplementedError(
-            "PrestoEncoder.encode_batch is intentionally unimplemented -- "
-            "see the PrestoEncoder class docstring: this script processes "
-            "one date's spatial tile at a time, but Presto expects a "
-            "per-location time series across dates. Restructure the "
-            "pipeline to assemble per-location series before calling "
-            "Presto, or use --encoder clay for now."
-        )
-
-
 # --------------------------------------------------------------------------
 # Raster / masking helpers
 # --------------------------------------------------------------------------
@@ -465,7 +406,11 @@ def parse_date_from_filename(filename):
 # Main per-file / per-directory processing
 # --------------------------------------------------------------------------
 
-def process_file(filepath, shapefile_path, subcatchment_id, sensor, encoder):
+def process_file(filepath, shapefile_path, subcatchment_id, sensor, encoder, cache=None, date=None):
+    """One date's raster -> (embedding, indices). encoder=None means cache-only: no
+    embedding is computed (embedding is None). If `cache` (a PixelCacheBuilder) is
+    given, the sampled-pixel values for this date are added to it, as the LAST step,
+    so a date that fails earlier is in neither the embeddings nor the cache."""
     array, transform, crs = read_geotiff(filepath)
     catchment_mask = build_catchment_mask(shapefile_path, subcatchment_id, transform, crs, array.shape[1:])
 
@@ -480,100 +425,143 @@ def process_file(filepath, shapefile_path, subcatchment_id, sensor, encoder):
         # Only tile where S1 actually has data, so empty scenes yield 0 patches.
         final_mask = s1_valid_mask(array, catchment_mask)
 
-    patches = tile_patches(encode_array, final_mask, encoder.patch_size)
-    n_patches = len(patches)
-    if n_patches == 0:
-        dim = encoder.embedding_dim if encoder.embedding_dim else 1
-        embedding = np.full(dim, np.nan, dtype="float32")
-    else:
-        patch_embeddings = encoder.encode_batch(patches)
-        embedding = np.nanmean(patch_embeddings, axis=0)
+    embedding = None
+    if encoder is not None:
+        patches = tile_patches(encode_array, final_mask, encoder.patch_size)
+        n_patches = len(patches)
+        if n_patches == 0:
+            dim = encoder.embedding_dim if encoder.embedding_dim else 1
+            embedding = np.full(dim, np.nan, dtype="float32")
+        else:
+            patch_embeddings = encoder.encode_batch(patches)
+            embedding = np.nanmean(patch_embeddings, axis=0)
+        indices["n_patches_used"] = n_patches
 
-    indices["n_patches_used"] = n_patches
+    if cache is not None:
+        cache.add(date, array, transform, crs, final_mask, catchment_mask=catchment_mask)
     return embedding, indices
 
 
-def build_encoder(encoder_name, sensor, clay_checkpoint=None, presto_checkpoint=None,
-                  clay_metadata=MODEL_METADATA_PATH):
+def build_encoder(encoder_name, sensor, clay_checkpoint=None, clay_metadata=MODEL_METADATA_PATH):
     n_bands = len(S2_BAND_ORDER) - 1 if sensor == "s2" else len(S1_BAND_ORDER)
     if encoder_name == "dummy":
         return DummyEncoder(n_bands)
     elif encoder_name == "clay":
         return ClayEncoder(clay_checkpoint, sensor, metadata_path=clay_metadata)
+    elif encoder_name in (None, "none"):
+        return None
     elif encoder_name == "presto":
-        return PrestoEncoder(presto_checkpoint)
+        raise ValueError("Presto does not run from the raw imagery. Write the pixel cache here "
+                         "(any encoder, or 'none' for cache-only), then run extract_presto.py.")
     raise ValueError(f"Unknown encoder: {encoder_name}")
 
 
 def run_extraction(sensor, input_dir, shapefile, subcatchment_id, encoder,
-                    out_embeddings, out_indices):
-    """Shared implementation used by both the CLI (main()) and the
-    importable extract_embeddings() wrapper below. `encoder` here must
-    already be an encoder INSTANCE (DummyEncoder/ClayEncoder/PrestoEncoder),
-    not a string -- build it with build_encoder() first.
-    """
+                    out_embeddings, out_indices, cache_out=None, cache_station=None,
+                    cache_year=None, cache_pixels=256, cache_window=3):
+    """Shared implementation used by both the CLI (main()) and the importable
+    extract_embeddings() wrapper. `encoder` must already be an encoder INSTANCE
+    (build it with build_encoder()), or None for cache-only mode.
+
+    cache_out: (npz_path, stats_csv_path) to also write the pixel cache, else None.
+    With encoder=None, out_embeddings / out_indices may be None and only the cache
+    is written (cache_out is then required)."""
+    if encoder is None and cache_out is None:
+        raise ValueError("nothing to do: no encoder and no cache requested")
     files = sorted(glob.glob(os.path.join(input_dir, "*.tif")))
     if not files:
         print(f"No .tif files found in {input_dir}", file=sys.stderr)
         return {"n_dates_processed": 0}
 
+    builder = (PixelCacheBuilder(cache_station, sensor, cache_year, cache_pixels, cache_window)
+               if cache_out else None)
     embeddings = {}
     rows = []
+    n_done = 0
     for fp in files:
         date = parse_date_from_filename(os.path.basename(fp))
         if date is None:
             print(f"  could not parse date from {fp}, skipped")
             continue
         try:
-            embedding, indices = process_file(fp, shapefile, subcatchment_id, sensor, encoder)
-            embeddings[date] = embedding
+            embedding, indices = process_file(fp, shapefile, subcatchment_id, sensor, encoder,
+                                              cache=builder, date=date)
+            if embedding is not None:
+                embeddings[date] = embedding
             rows.append({"date": date, **indices})
-            print(f"  {date}: {indices['n_patches_used']} patches used, "
-                  f"valid_pixel_frac={indices['valid_pixel_frac']:.2f}")
+            n_done += 1
+            extra = f"{indices['n_patches_used']} patches used, " if "n_patches_used" in indices else ""
+            print(f"  {date}: {extra}valid_pixel_frac={indices['valid_pixel_frac']:.2f}")
         except Exception as e:
             print(f"  {date}: ERROR -- {e}")
 
-    np.savez_compressed(out_embeddings, **embeddings)
-    pd.DataFrame(rows).to_csv(out_indices, index=False)
-    print(f"\n{len(embeddings)} dates processed.")
-    print(f"Embeddings written to: {out_embeddings}")
-    print(f"Hand-crafted indices written to: {out_indices}")
-    return {"n_dates_processed": len(embeddings)}
+    if encoder is not None:
+        np.savez_compressed(out_embeddings, **embeddings)
+        pd.DataFrame(rows).to_csv(out_indices, index=False)
+        print(f"\n{len(embeddings)} dates processed.")
+        print(f"Embeddings written to: {out_embeddings}")
+        print(f"Hand-crafted indices written to: {out_indices}")
+    if builder is not None and n_done:
+        builder.save(cache_out[0], stats_rows=rows, stats_path=cache_out[1])
+        print(f"Pixel cache ({n_done} dates) written to: {cache_out[0]}")
+    return {"n_dates_processed": n_done}
 
 
 def extract_embeddings(sensor, input_dir, shapefile, subcatchment_id, encoder,
                         out_embeddings, out_indices,
                         clay_checkpoint="checkpoints/clay/clay-v1.5.ckpt",
-                        presto_checkpoint="checkpoints/presto/presto-main/data/default_model.pt",
-                        clay_metadata=MODEL_METADATA_PATH):
-    """Importable entry point (e.g. for run_catchment_pipeline.py) mirroring
-    the CLI. `encoder` here is a STRING ("dummy"/"clay"/"presto"), matching
-    the --encoder CLI flag -- this function builds the actual encoder
-    instance for you, same as main() does.
-    """
-    encoder_instance = build_encoder(encoder, sensor, clay_checkpoint, presto_checkpoint, clay_metadata)
-    return run_extraction(sensor, input_dir, shapefile, subcatchment_id,
-                           encoder_instance, out_embeddings, out_indices)
+                        clay_metadata=MODEL_METADATA_PATH,
+                        cache_out=None, cache_station=None, cache_year=None,
+                        cache_pixels=256, cache_window=3):
+    """Importable entry point (e.g. for run_catchment_pipeline.py) mirroring the CLI.
+    `encoder` here is a STRING ("dummy"/"clay"/"none"), matching --encoder; "none" =
+    cache-only (cache_out required). This function builds the encoder instance."""
+    encoder_instance = build_encoder(encoder, sensor, clay_checkpoint, clay_metadata)
+    return run_extraction(sensor, input_dir, shapefile, subcatchment_id, encoder_instance,
+                           out_embeddings, out_indices, cache_out=cache_out,
+                           cache_station=cache_station, cache_year=cache_year,
+                           cache_pixels=cache_pixels, cache_window=cache_window)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract pooled catchment embeddings from downloaded imagery.")
+    parser = argparse.ArgumentParser(description="Extract pooled catchment embeddings (and the pixel cache) from downloaded imagery.")
     parser.add_argument("--input-dir", required=True, help="Folder of downloaded GeoTIFFs for one catchment+sensor")
     parser.add_argument("--shapefile", required=True)
     parser.add_argument("--subcatchment-id", required=True)
     parser.add_argument("--sensor", required=True, choices=["s1", "s2"])
-    parser.add_argument("--encoder", default="dummy", choices=["dummy", "clay", "presto"])
+    parser.add_argument("--encoder", default="dummy", choices=["dummy", "clay", "none"],
+                        help="'none' = write only the pixel cache (needs --cache)")
     parser.add_argument("--clay-checkpoint", default="checkpoints/clay/clay-v1.5.ckpt")
     parser.add_argument("--clay-metadata", default=MODEL_METADATA_PATH)
-    parser.add_argument("--presto-checkpoint", default="checkpoints/presto/presto-main/data/default_model.pt")
-    parser.add_argument("--out-embeddings", required=True)
-    parser.add_argument("--out-indices", required=True)
+    parser.add_argument("--out-embeddings", default=None,
+                        help="default: <results root>/checks/embeddings_<input folder name>.npz "
+                             "(standalone runs are treated as checks; the pipeline writes to results/embeddings)")
+    parser.add_argument("--out-indices", default=None, help="default: <results root>/checks/indices_<input folder name>.csv")
+    parser.add_argument("--cache", action="store_true",
+                        help="also write the pixel cache to <results root>/checks/ (station/year parsed from the folder name)")
+    parser.add_argument("--cache-pixels", type=int, default=256)
+    parser.add_argument("--cache-window", type=int, default=3)
+    parser.add_argument("--results-root", default=None, help="default: <project>/results or $FFB_RESULTS_ROOT")
     args = parser.parse_args()
 
-    encoder = build_encoder(args.encoder, args.sensor, args.clay_checkpoint,
-                            args.presto_checkpoint, args.clay_metadata)
-    run_extraction(args.sensor, args.input_dir, args.shapefile, args.subcatchment_id,
-                    encoder, args.out_embeddings, args.out_indices)
+    from project_paths import Layout, ensure_parent
+    from pixel_cache import cache_paths
+    tag = os.path.basename(os.path.normpath(args.input_dir))
+    checks = Layout(args.results_root).checks
+    cache_out = st = yr = None
+    if args.cache or args.encoder == "none":
+        m = re.match(r"^s[12]_(.+)_(\d{4})$", tag)
+        st, yr = (m.group(1), int(m.group(2))) if m else (tag, None)
+        cache_out = cache_paths(checks, st, args.sensor, yr)
+        ensure_parent(cache_out[0])
+    if args.encoder != "none":
+        args.out_embeddings = ensure_parent(args.out_embeddings or os.path.join(checks, f"embeddings_{tag}.npz"))
+        args.out_indices = ensure_parent(args.out_indices or os.path.join(checks, f"indices_{tag}.csv"))
+
+    encoder = build_encoder(args.encoder, args.sensor, args.clay_checkpoint, args.clay_metadata)
+    run_extraction(args.sensor, args.input_dir, args.shapefile, args.subcatchment_id, encoder,
+                    args.out_embeddings, args.out_indices, cache_out=cache_out, cache_station=st,
+                    cache_year=yr, cache_pixels=args.cache_pixels, cache_window=args.cache_window)
 
 
 if __name__ == "__main__":

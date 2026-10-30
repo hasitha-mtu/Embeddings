@@ -32,6 +32,11 @@ Usage:
     # plus the labels check (labels file from build_antecedent_labels.py):
     ... --labels antecedent_state_labels.csv --station-id 11001
 
+    # Output: the figure and a text copy of this report are written to
+    # <results root>/verification/verify_<station>_<sensor>_<year>.png/.txt
+    # (named after the embeddings file). --out-png overrides; --results-root
+    # or $FFB_RESULTS_ROOT moves the root. See project_paths.py.
+
     # plus a determinism check against a second run on the same dates:
     ... --compare other_run.npz
 
@@ -79,8 +84,19 @@ def main():
     ap.add_argument("--labels", default=None, help="antecedent_state_labels.csv (optional)")
     ap.add_argument("--station-id", default=None, help="station to select from --labels")
     ap.add_argument("--compare", default=None, help="second .npz of the same dates, to test determinism")
-    ap.add_argument("--out-png", default="verify_embeddings.png")
+    ap.add_argument("--out-png", default=None, help="default: <results root>/verification/verify_<run>.png")
+    ap.add_argument("--results-root", default=None, help="default: <project>/results or $FFB_RESULTS_ROOT")
     args = ap.parse_args()
+
+    import os
+    import re
+    from project_paths import Layout, ensure_parent, tee_stdout
+    m_name = re.match(r"embeddings_(.+)\.npz$", os.path.basename(args.embeddings))
+    tag = f"verify_{m_name.group(1)}" if m_name else "verify_embeddings"
+    if args.out_png is None:
+        args.out_png = os.path.join(Layout(args.results_root).verification, tag + ".png")
+    ensure_parent(args.out_png)
+    tee_stdout(os.path.splitext(args.out_png)[0] + ".txt")
 
     emb = np.load(args.embeddings)
     idx = pd.read_csv(args.indices, dtype={"date": str})

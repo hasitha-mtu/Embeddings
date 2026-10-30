@@ -167,13 +167,19 @@ def main():
     parser.add_argument("--sensors", default="s1,s2")
     parser.add_argument("--max-cloud-pct", type=float, default=60.0)
     parser.add_argument("--station-id-filter", default=None)
-    parser.add_argument("--out-manifest", default="cdse_export_manifest.csv")
+    parser.add_argument("--out-manifest", default=None,
+                         help="default: <results root>/manifests/cdse_export_manifest.csv (see project_paths.py)")
+    parser.add_argument("--results-root", default=None, help="default: <project>/results or $FFB_RESULTS_ROOT")
     parser.add_argument("--list-collections", action="store_true",
                          help="Just connect, print available collection IDs, and exit -- run this first")
     parser.add_argument("--list-file-formats", action="store_true",
                          help="Connect, print the GTiff writer's actual supported output "
                               "options (e.g. the correct datatype/compression keys), and exit")
     args = parser.parse_args()
+
+    from project_paths import Layout, ensure_parent
+    args.out_manifest = ensure_parent(
+        args.out_manifest or os.path.join(Layout(args.results_root).manifests, "cdse_export_manifest.csv"))
 
     print("Connecting to CDSE openEO backend...")
     conn = connect(args.client_id, args.client_secret)

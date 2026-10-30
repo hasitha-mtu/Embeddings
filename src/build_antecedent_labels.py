@@ -42,8 +42,9 @@ interrupted run can just be re-launched with the same command.
 Usage:
     python build_antecedent_labels.py \
         --station-list catchment_level_shortlist.csv \
-        --data-dir "C:\Users\AdikariAdikari\PycharmProjects\Embeddings\dataset\raw\water_level" \
-        --out antecedent_state_labels.csv
+        --data-dir "C:\Users\AdikariAdikari\PycharmProjects\Embeddings\dataset\raw\water_level"
+
+Output defaults to <results root>/labels/antecedent_state_labels.csv; --out overrides.
 
 Requires: pandas, numpy, scipy  (pip install pandas numpy scipy)
 """
@@ -256,9 +257,14 @@ def main():
     parser.add_argument("--station-list", required=True,
                          help="CSV containing a 'station_id' column (e.g. catchment_level_shortlist.csv)")
     parser.add_argument("--data-dir", required=True, help="Directory containing the raw station CSV files")
-    parser.add_argument("--out", default="antecedent_state_labels.csv")
+    parser.add_argument("--out", default=None,
+                         help="default: <results root>/labels/antecedent_state_labels.csv (see project_paths.py)")
+    parser.add_argument("--results-root", default=None, help="default: <project>/results or $FFB_RESULTS_ROOT")
     parser.add_argument("--restart", action="store_true")
     args = parser.parse_args()
+
+    from project_paths import Layout, ensure_parent
+    args.out = ensure_parent(args.out or os.path.join(Layout(args.results_root).labels, "antecedent_state_labels.csv"))
 
     stations = pd.read_csv(args.station_list)
     if "station_id" not in stations.columns:

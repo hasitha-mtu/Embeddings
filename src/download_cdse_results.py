@@ -86,11 +86,22 @@ def download_data(manifest, out_dir, client_id = None, client_secret = None):
 
 def main():
     parser = argparse.ArgumentParser(description="Poll and download finished CDSE openEO jobs.")
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--manifest", default=None,
+                        help="default: <results root>/manifests/cdse_export_manifest.csv (see project_paths.py)")
+    parser.add_argument("--out-dir", default=None,
+                        help="default: <results root>/scratch/downloads (transient raw imagery)")
+    parser.add_argument("--results-root", default=None, help="default: <project>/results or $FFB_RESULTS_ROOT")
     parser.add_argument("--client-id", default=None)
     parser.add_argument("--client-secret", default=None)
     args = parser.parse_args()
+
+    from project_paths import Layout
+    layout = Layout(args.results_root)
+    args.manifest = args.manifest or os.path.join(layout.manifests, "cdse_export_manifest.csv")
+    args.out_dir = args.out_dir or layout.scratch_downloads
+    if not os.path.exists(args.manifest):
+        print(f"Error: manifest not found: {args.manifest}", file=sys.stderr)
+        sys.exit(1)
 
     os.makedirs(args.out_dir, exist_ok=True)
     conn = connect(args.client_id, args.client_secret)
