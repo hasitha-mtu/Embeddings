@@ -84,7 +84,7 @@ from pixel_cache import PixelCacheBuilder
 # claymodel package installed.
 
 # Clay's own band/normalization metadata (ships with the Clay repo under configs/).
-MODEL_METADATA_PATH = "C:/Users/AdikariAdikari/PycharmProjects/Embeddings/checkpoints/clay/configs/metadata.yaml"
+MODEL_METADATA_PATH = "/checkpoints/clay/configs/metadata.yaml"
 
 # SCL classes to exclude as invalid: 0=no data, 1=saturated, 3=cloud shadow,
 # 8/9=cloud medium/high probability, 10=thin cirrus
